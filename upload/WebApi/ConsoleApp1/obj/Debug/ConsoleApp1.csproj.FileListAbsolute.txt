@@ -1,0 +1,10 @@
+D:\teststudy\UploadingService\ConsoleApp1\obj\Debug\ConsoleApp1.csproj.AssemblyReference.cache
+D:\teststudy\UploadingService\ConsoleApp1\obj\Debug\ConsoleApp1.csproj.CoreCompileInputs.cache
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\test.png
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\ConsoleApp1.exe.config
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\ConsoleApp1.exe
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\ConsoleApp1.pdb
+D:\teststudy\UploadingService\ConsoleApp1\obj\Debug\ConsoleApp1.exe
+D:\teststudy\UploadingService\ConsoleApp1\obj\Debug\ConsoleApp1.pdb
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\MyLogs\log1.txt
+D:\teststudy\UploadingService\ConsoleApp1\bin\Debug\MyLogs\log2.txt
