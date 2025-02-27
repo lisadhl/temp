@@ -1,5 +1,7 @@
 ﻿using A.TaskDispatching;
 
+using Serilog;
+
 using System;
 using System.Diagnostics;
 using System.Text;
@@ -40,7 +42,7 @@ namespace A.UI.Service
 
         public override void Execute()
         {
-            OnStarting(new TaskStartingEventArgs(MinashiDateTime.Now));
+            OnStarting(new TaskEventArgs(MinashiDateTime.Now));
             StartProcess();
             OnCompleted(
                     new TaskCompletedEventArgs(
@@ -52,6 +54,9 @@ namespace A.UI.Service
 
         private void StartProcess()
         {
+            int processId = Process.GetCurrentProcess().Id;
+            Log.Information("[Main {ProcessId}] Task {TaskName} starting.", processId, Name);
+
             Process process = new Process();
             ProcessStartInfo startInfo = process.StartInfo;
 
@@ -68,6 +73,11 @@ namespace A.UI.Service
             process.ErrorDataReceived += OnProcessErrorDataReceived;
 
             bool success = process.Start();
+
+            NotifyStarted();
+            OnStarted(new TaskEventArgs(MinashiDateTime.Now));
+
+            Log.Information("[Main {ProcessId}] Task {TaskName} started.", processId, Name);
 
             if (!success)
             {

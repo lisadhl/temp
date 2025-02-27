@@ -1,9 +1,13 @@
 ﻿using A.UI.Service;
 
+using Serilog;
+
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace A.TaskDispatching
@@ -35,9 +39,21 @@ namespace A.TaskDispatching
         Task ExecuteAsync();
 
         /// <summary>
-        /// 启动事件
+        /// 用于等待任务启动。
         /// </summary>
-        event EventHandler<TaskStartingEventArgs> Starting;
+        /// <param name="waitStartedTimeoutSeconds">等待超时时间</param>
+        /// <returns></returns>
+        Task WaitStartedAsync(int waitStartedTimeoutSeconds);
+
+        /// <summary>
+        /// 开始启动事件
+        /// </summary>
+        event EventHandler<TaskEventArgs> Starting;
+
+        /// <summary>
+        /// 完成启动事件
+        /// </summary>
+        event EventHandler<TaskEventArgs> Started;
 
         /// <summary>
         /// 状态报告事件
@@ -56,7 +72,8 @@ namespace A.TaskDispatching
 
         public DateTimeOffset CreationTime { get; set; } = MinashiDateTime.Now;
 
-        public event EventHandler<TaskStartingEventArgs> Starting;
+        public event EventHandler<TaskEventArgs> Starting;
+        public event EventHandler<TaskEventArgs> Started;
         public event EventHandler<TaskReportStatusEventArgs> ReportStatus;
         public event EventHandler<TaskCompletedEventArgs> Completed;
 
@@ -67,9 +84,14 @@ namespace A.TaskDispatching
             return Task.Factory.StartNew(() => Execute());
         }
 
-        protected virtual void OnStarting(TaskStartingEventArgs e)
+        protected virtual void OnStarting(TaskEventArgs e)
         {
             Starting?.Invoke(this, e);
+        }
+
+        protected virtual void OnStarted(TaskEventArgs e)
+        {
+            Started?.Invoke(this, e);
         }
 
         protected virtual void OnReportStatus(TaskReportStatusEventArgs e)
@@ -80,6 +102,56 @@ namespace A.TaskDispatching
         protected virtual void OnCompleted(TaskCompletedEventArgs e)
         {
             Completed?.Invoke(this, e);
+        }
+
+        private readonly CancellationTokenSource _taskWaitStartedTokeSource = new CancellationTokenSource();
+
+        public async Task WaitStartedAsync(int waitStartedTimeoutSeconds)
+        {
+            Task waitTask = WaitStartedAsync();
+            Task timeoutTask = waitStartedTimeoutSeconds > 0
+                               ? Task.Delay(TimeSpan.FromSeconds(waitStartedTimeoutSeconds))
+                               : null;
+
+            List<Task> tasks = new List<Task>
+            {
+                waitTask,
+            };
+
+            if (timeoutTask != null)
+            {
+                tasks.Add(timeoutTask);
+            }
+
+            Task task = await Task.WhenAny(tasks);
+
+            if (task == timeoutTask)
+            {
+                _taskWaitStartedTokeSource.Cancel();
+
+                int processId = Process.GetCurrentProcess().Id;
+                Log.Information("[Main {ProcessId}] Wait task {TaskName} started timeout.", processId, Name);
+            }
+
+            async Task WaitStartedAsync()
+            {
+                CancellationToken onStartedToken = _taskWaitStartedTokeSource.Token;
+
+                while (true)
+                {
+                    if (onStartedToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+
+                    await Task.Delay(1000); // Wait 1s
+                }
+            }
+        }
+
+        protected void NotifyStarted()
+        {
+            _taskWaitStartedTokeSource.Cancel();
         }
     }
 
@@ -96,14 +168,16 @@ namespace A.TaskDispatching
                 this ITask worker,
                 int number,
                 bool runNextOnFailed,
-                TaskItem configuration
+                TaskItem configuration,
+                int waitStartedTimeoutSecond = 10
             )
         {
             return new PrimitiveSchedulerTask(
                     worker,
                     number,
                     runNextOnFailed,
-                    configuration
+                    configuration,
+                    waitStartedTimeoutSecond
                 );
         }
     }
@@ -136,6 +210,11 @@ namespace A.TaskDispatching
         /// 获取任务状态。
         /// </summary>
         public abstract SchedulerTaskStatus Status { get; }
+
+        /// <summary>
+        /// 用于等待任务启动。
+        /// </summary>
+        public Task CanStartNextTask { get; protected set; } = Task.CompletedTask;
 
         /// <summary>
         /// 用于决定当本条任务失败时，下条任务是否执行（只有当下条任务等待时才有效）。
@@ -188,17 +267,19 @@ namespace A.TaskDispatching
     /// </summary>
     public class PrimitiveSchedulerTask : SchedulerTask
     {
-        public PrimitiveSchedulerTask(ITask task, int number, bool runNextOnFailed, TaskItem configuration)
+        public PrimitiveSchedulerTask(ITask task, int number, bool runNextOnFailed, TaskItem configuration, int waitStartedTimeoutSecond = 10)
         {
             Worker = task;
             CreationTime = task.CreationTime;
 
             Configuration = configuration;
+            WaitStartedTimeoutSecond = waitStartedTimeoutSecond;
 
             Number = number;
             RunNextOnFailed = runNextOnFailed;
 
             task.Starting += OnWorkerStarting;
+            task.Started += OnWorkerStarted;
             task.ReportStatus += OnTaskReportStatus;
             task.Completed += OnWorkerCompleted;
         }
@@ -232,6 +313,11 @@ namespace A.TaskDispatching
         /// 工作任务创建时间
         /// </summary>
         public DateTimeOffset CreationTime { get; }
+
+        /// <summary>
+        /// 等待任务启动超时时间。
+        /// </summary>
+        public int WaitStartedTimeoutSecond { get; }
 
         /// <summary>
         /// 延迟
@@ -281,23 +367,34 @@ namespace A.TaskDispatching
         /// 异步执行任务。
         /// </summary>
         /// <returns></returns>
-        public async Task ExecuteAsync()
+        public Task ExecuteAsync()
         {
-            if (Delay > TimeSpan.Zero)
-            {
-                await Task.Delay(Delay);
-            }
+            CanStartNextTask = Worker.WaitStartedAsync(WaitStartedTimeoutSecond);
 
-            try
-            {
-                await Worker.ExecuteAsync();
-            }
-            catch (Exception ex)
-            {
-                DateTimeOffset timestamp = MinashiDateTime.Now;
-                Error = ex;
+            return DoExecuteAsync();
 
-                ChangeStatus(SchedulerTaskStatus.Failed, timestamp);
+
+            async Task DoExecuteAsync()
+            {
+                if (Delay > TimeSpan.Zero)
+                {
+                    await Task.Delay(Delay);
+                }
+
+                try
+                {
+                    await Worker.ExecuteAsync();
+                }
+                catch (Exception ex)
+                {
+                    DateTimeOffset timestamp = MinashiDateTime.Now;
+                    Error = ex;
+
+                    ChangeStatus(SchedulerTaskStatus.Failed, timestamp);
+
+                    int processId = Process.GetCurrentProcess().Id;
+                    Serilog.Log.Information("[Main {ProcessId}] Task {TaskName} failed.", processId, Name);
+                }
             }
         }
 
@@ -307,6 +404,7 @@ namespace A.TaskDispatching
         /// <returns></returns>
         public override bool Pending()
         {
+            int processId = Process.GetCurrentProcess().Id;
             if (Status != SchedulerTaskStatus.Waiting)
             {
                 return false;
@@ -314,16 +412,24 @@ namespace A.TaskDispatching
 
             ChangeStatus(SchedulerTaskStatus.Pending);
 
+            Serilog.Log.Information("[Main {ProcessId}] Task {TaskName} canceled.", processId, Name);
+
             return true;
         }
 
         public override string ToString() => Name;
 
         // WorkerTask 事件传递到外部
-        private void OnWorkerStarting(object sender, TaskStartingEventArgs e)
+        private void OnWorkerStarting(object sender, TaskEventArgs e)
         {
             Log.Add(BuildLog(e.Timestamp, "Starting..."));
-            ChangeStatus(SchedulerTaskStatus.Running, e.Timestamp);
+            ChangeStatus(SchedulerTaskStatus.Starting, e.Timestamp);
+        }
+
+        private void OnWorkerStarted(object sender, TaskEventArgs e)
+        {
+            Log.Add(BuildLog(e.Timestamp, "Started..."));
+            ChangeStatus(SchedulerTaskStatus.Started, e.Timestamp);
         }
 
         private void OnTaskReportStatus(object sender, TaskReportStatusEventArgs e)
@@ -335,14 +441,18 @@ namespace A.TaskDispatching
         private void OnWorkerCompleted(object sender, TaskCompletedEventArgs e)
         {
             _errorMessage = e.ErrorMessage;
+            string completedStatus = e.Success ? "Succeeded" : $"Failed: {e.ErrorMessage}";
 
             Log.Add(
                     BuildLog(
                             e.Timestamp,
-                            e.Success ? "Succeeded" : $"Failed: {e.ErrorMessage}"
+                            completedStatus
                         )
                 );
             ChangeStatus(e.Success ? SchedulerTaskStatus.Succeeded : SchedulerTaskStatus.Failed, e.Timestamp);
+
+            int processId = Process.GetCurrentProcess().Id;
+            Serilog.Log.Information("[Main {ProcessId}] Task {TaskName} {completedStatus}.", processId, Name, completedStatus);
         }
 
         private void ChangeStatus(SchedulerTaskStatus status, DateTimeOffset timestamp = default)
@@ -355,6 +465,15 @@ namespace A.TaskDispatching
             _status = status;
 
             TaskStatusChanged?.Invoke(this, new SchedulerTaskStatusChangedEventArgs(timestamp, this));
+
+            int processId = Process.GetCurrentProcess().Id;
+            Serilog.Log.Information(
+                    "[Task {Name} {ProcessId}] Status change to {Status} - {StatusDisplayName}.",
+                    Name,
+                    processId,
+                    status,
+                    status.GetDisplayName()
+                );
         }
 
         private static string BuildLog(DateTimeOffset timestamp, string message) =>
@@ -414,13 +533,21 @@ namespace A.TaskDispatching
         /// </summary>
         /// <param name="remainderTaskCollector"></param>
         /// <returns></returns>
-        public override Task ExecuteAsync(List<Task> remainderTaskCollector)
+        public override async Task ExecuteAsync(List<Task> remainderTaskCollector)
         {
-            List<Task> all = PrimitiveSchedulerTasks.Select(t => t.ExecuteAsync()).ToList();
+            List<Task> all = new List<Task>();
+
+            foreach (PrimitiveSchedulerTask schedulerTask in PrimitiveSchedulerTasks)
+            {
+                all.Add(schedulerTask.ExecuteAsync());
+                await schedulerTask.CanStartNextTask;
+            }
 
             remainderTaskCollector.AddRange(all.Where((_, index) => index < all.Count - 1));
 
-            return all[all.Count - 1];
+            CanStartNextTask = all[all.Count - 1];
+
+            await CanStartNextTask;
         }
 
         /// <summary>
@@ -508,6 +635,7 @@ namespace A.TaskDispatching
                 }
 
                 await schedulerTask.ExecuteAsync(allRemainderTasks);
+
                 canRunNext = schedulerTask.CanRunNext();
             }
 
